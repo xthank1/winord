@@ -12,14 +12,30 @@ import threading
 import time
 import re
 import sys
-import json
-import ssl
-import urllib.request
-import urllib.parse
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ctypes
 import os
 import textwrap
+
+# ── HTTP 连接池（复用 TCP/TLS 连接，减少握手开销） ──────
+
+_http_sessions = {}
+_HTTP_TIMEOUT = 2.5
+
+def _get_session(host: str) -> requests.Session:
+    """获取或创建针对指定主机的持久 Session（连接复用）。"""
+    s = _http_sessions.get(host)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({'User-Agent': 'Mozilla/5.0'})
+        # 连接池：最多 2 个持久连接，适配并发请求
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1, pool_maxsize=2, max_retries=0
+        )
+        s.mount(f'https://{host}', adapter)
+        _http_sessions[host] = s
+    return s
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -163,6 +179,30 @@ def _load_bing_engine():
         print(f"[!] 必应引擎加载失败: {e}")
 
 
+def _prewarm_connections():
+    """后台线程：预热 HTTP 连接，提前完成 TCP+TLS 握手。"""
+    try:
+        # 发送极小翻译请求预热 MyMemory
+        session = _get_session('api.mymemory.translated.net')
+        session.get(
+            'https://api.mymemory.translated.net/get',
+            params={'q': 'hi', 'langpair': 'en|zh-CN'},
+            timeout=5,
+        )
+    except Exception:
+        pass
+    try:
+        # 发送极小翻译请求预热 Google
+        session = _get_session('translate.googleapis.com')
+        session.get(
+            'https://translate.googleapis.com/translate_a/single',
+            params={'client': 'gtx', 'sl': 'en', 'tl': 'zh-CN', 'dt': 't', 'q': 'hi'},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 # ── 翻译结果缓存 ──────────────────────────────────────────
 
 _cache = {}
@@ -179,8 +219,9 @@ def translate(text):
     if not text:
         return ""
 
-    # 命中缓存直接返回
-    cached = _cache.get(text)
+    # 空白归一化后查缓存，提高命中率
+    normalized = ' '.join(text.split())
+    cached = _cache.get(normalized)
     if cached is not None:
         return cached
 
@@ -217,7 +258,11 @@ def translate(text):
             try:
                 result = fut.result()
                 if result:
-                    _add_to_cache(text, result)
+                    _add_to_cache(normalized, result)
+                    # 取消其余仍在等待的后端请求
+                    for f in futures:
+                        if f is not fut and not f.done():
+                            f.cancel()
                     return result
             except Exception as e:
                 errors.append(f"{name}: {e}")
@@ -237,46 +282,36 @@ def _add_to_cache(key: str, value: str) -> None:
 
 
 def _translate_mymemory(text):
-    """MyMemory 免费翻译 API。"""
-    params = urllib.parse.urlencode({
-        'q': text,
-        'langpair': 'en|zh-CN'
-    })
-    url = f"https://api.mymemory.translated.net/get?{params}"
-    ctx = ssl.create_default_context()
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-        if data.get('responseStatus') == 200:
-            result = data['responseData']['translatedText'].strip()
-            if result:
-                return result
+    """MyMemory 免费翻译 API（连接池复用）。"""
+    session = _get_session('api.mymemory.translated.net')
+    resp = session.get(
+        'https://api.mymemory.translated.net/get',
+        params={'q': text, 'langpair': 'en|zh-CN'},
+        timeout=_HTTP_TIMEOUT,
+    )
+    data = resp.json()
+    if data.get('responseStatus') == 200:
+        result = data['responseData']['translatedText'].strip()
+        if result:
+            return result
     raise Exception("MyMemory 返回空结果")
 
 
 def _translate_google(text):
-    """Google Translate 免费 API。"""
-    params = urllib.parse.urlencode({
-        'client': 'gtx',
-        'sl': 'en',
-        'tl': 'zh-CN',
-        'dt': 't',
-        'q': text,
-    })
-    url = f"https://translate.googleapis.com/translate_a/single?{params}"
-    ctx = ssl.create_default_context()
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0',
-        'Referer': 'https://translate.google.com/',
-    })
-    with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-        # API returns: [[["translated","original",...]], ...]
-        if data and data[0]:
-            parts = [s[0] for s in data[0] if s[0]]
-            result = ''.join(parts).strip()
-            if result:
-                return result
+    """Google Translate 免费 API（连接池复用）。"""
+    session = _get_session('translate.googleapis.com')
+    resp = session.get(
+        'https://translate.googleapis.com/translate_a/single',
+        params={'client': 'gtx', 'sl': 'en', 'tl': 'zh-CN', 'dt': 't', 'q': text},
+        headers={'Referer': 'https://translate.google.com/'},
+        timeout=_HTTP_TIMEOUT,
+    )
+    data = resp.json()
+    if data and data[0]:
+        parts = [s[0] for s in data[0] if s[0]]
+        result = ''.join(parts).strip()
+        if result:
+            return result
     raise Exception("Google 返回空结果")
 
 
@@ -350,6 +385,7 @@ class LyricsOverlay:
         # 后台任务
         threading.Thread(target=self._clipboard_watch, daemon=True).start()
         threading.Thread(target=_load_bing_engine, daemon=True).start()
+        threading.Thread(target=_prewarm_connections, daemon=True).start()
 
         # 初始显示
         self._show("划词翻译就绪 · 复制英文即可翻译")
