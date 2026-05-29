@@ -191,17 +191,6 @@ def _prewarm_connections():
         )
     except Exception:
         pass
-    try:
-        # 发送极小翻译请求预热 Google
-        session = _get_session('translate.googleapis.com')
-        session.get(
-            'https://translate.googleapis.com/translate_a/single',
-            params={'client': 'gtx', 'sl': 'en', 'tl': 'zh-CN', 'dt': 't', 'q': 'hi'},
-            timeout=5,
-        )
-    except Exception:
-        pass
-
 
 # ── 翻译结果缓存 ──────────────────────────────────────────
 
@@ -213,7 +202,7 @@ _CACHE_MAX = 128
 def translate(text):
     """
     翻译英文 → 中文。
-    并行竞速：必应 / MyMemory / Google 同时发起，取最快返回的有效结果。
+    并行竞速：必应 / MyMemory 同时发起，取最快返回的有效结果。
     """
     text = text.strip()
     if not text:
@@ -240,7 +229,6 @@ def translate(text):
         backends.append(("bing", _do_bing))
 
     backends.append(("mymemory", lambda: _translate_mymemory(text)))
-    backends.append(("google",  lambda: _translate_google(text)))
 
     if not backends:
         raise Exception("没有可用的翻译后端")
@@ -253,7 +241,7 @@ def translate(text):
         for name, fn in backends:
             futures[pool.submit(fn)] = name
 
-        for fut in as_completed(futures):
+        for fut in as_completed(futures, timeout=5):
             name = futures[fut]
             try:
                 result = fut.result()
@@ -266,6 +254,8 @@ def translate(text):
                     return result
             except Exception as e:
                 errors.append(f"{name}: {e}")
+    except TimeoutError:
+        pass
     finally:
         pool.shutdown(wait=False)
 
@@ -297,24 +287,6 @@ def _translate_mymemory(text):
     raise Exception("MyMemory 返回空结果")
 
 
-def _translate_google(text):
-    """Google Translate 免费 API（连接池复用）。"""
-    session = _get_session('translate.googleapis.com')
-    resp = session.get(
-        'https://translate.googleapis.com/translate_a/single',
-        params={'client': 'gtx', 'sl': 'en', 'tl': 'zh-CN', 'dt': 't', 'q': text},
-        headers={'Referer': 'https://translate.google.com/'},
-        timeout=_HTTP_TIMEOUT,
-    )
-    data = resp.json()
-    if data and data[0]:
-        parts = [s[0] for s in data[0] if s[0]]
-        result = ''.join(parts).strip()
-        if result:
-            return result
-    raise Exception("Google 返回空结果")
-
-
 # ── 悬浮窗 UI ─────────────────────────────────────────────
 
 class LyricsOverlay:
@@ -341,6 +313,7 @@ class LyricsOverlay:
 
         self._color_idx = 0
         self._dst_colors = self.DST_COLORS
+        self._hover = False
 
         self._pad_x = 12
         self._pad_y = 8
@@ -416,10 +389,12 @@ class LyricsOverlay:
         self.root.bind('<Escape>', self.hide)
         self.root.bind('<MouseWheel>', self._on_scroll)
         self.root.bind('<Double-Button-1>', self._copy_dst)
+        self.root.bind('<Enter>', self._on_enter)
+        self.root.bind('<Leave>', self._on_leave)
 
     # ── PIL 文字渲染 ────────────────────────────────────
 
-    def _render(self, text, color=None):
+    def _render(self, text, color=None, hover=False):
         if color is None:
             color = self._dst_colors[self._color_idx]
 
@@ -454,6 +429,13 @@ class LyricsOverlay:
 
         img = Image.new('RGBA', (iw, ih), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
+
+        if hover:
+            draw.rectangle(
+                [(0, 0), (iw - 1, ih - 1)],
+                fill=(100, 180, 255, 50)
+            )
+
         draw.multiline_text(
             (self._pad_x, self._pad_y), wrapped,
             font=font, fill=(r, g, b, 255), spacing=4
@@ -464,7 +446,7 @@ class LyricsOverlay:
 
     def _show(self, text):
         self._current_text = text
-        img, w, h = self._render(text)
+        img, w, h = self._render(text, hover=self._hover)
         self.root.geometry(f"{w}x{h}")
         _update_layered(self._hwnd, img, self._x, self._y)
 
@@ -505,7 +487,19 @@ class LyricsOverlay:
         else:
             self._color_idx = (self._color_idx - 1) % len(self._dst_colors)
         if self._current_text:
-            img, _, _ = self._render(self._current_text)
+            img, _, _ = self._render(self._current_text, hover=self._hover)
+            _update_layered(self._hwnd, img, self._x, self._y)
+
+    def _on_enter(self, event):
+        self._hover = True
+        if self._current_text:
+            img, _, _ = self._render(self._current_text, hover=True)
+            _update_layered(self._hwnd, img, self._x, self._y)
+
+    def _on_leave(self, event):
+        self._hover = False
+        if self._current_text:
+            img, _, _ = self._render(self._current_text, hover=False)
             _update_layered(self._hwnd, img, self._x, self._y)
 
     # ── 复制操作 ─────────────────────────────────────────
@@ -552,8 +546,8 @@ class LyricsOverlay:
     def _run_translate(self, text):
         try:
             result = translate(text)
-        except Exception as e:
-            result = f"翻译失败: {e}"
+        except Exception:
+            result = text
         self.root.after(0, self._on_result, result)
 
     def _on_result(self, result):
