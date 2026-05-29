@@ -16,6 +16,7 @@ import json
 import ssl
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── 依赖检查 ──────────────────────────────────────────────
 
@@ -50,40 +51,77 @@ def _load_bing_engine():
         print(f"[!] 必应引擎加载失败: {e}")
 
 
+# ── 翻译结果缓存 ──────────────────────────────────────────
+
+_cache = {}
+_cache_keys = []
+_CACHE_MAX = 128
+
+
 def translate(text):
     """
     翻译英文 → 中文。
-    优先使用必应，失败则回退到 MyMemory / Google 备用。
+    并行竞速：必应 / MyMemory / Google 同时发起，取最快返回的有效结果。
     """
     text = text.strip()
     if not text:
         return ""
 
-    # 方案1: 必应翻译
+    # 命中缓存直接返回
+    cached = _cache.get(text)
+    if cached is not None:
+        return cached
+
+    # 构建后端列表，每个是一个 (name, callable) 对
+    backends = []
+
     if _bing_ready and _bing_translator:
-        try:
+        def _do_bing():
             result = _bing_translator(
                 text, translator='bing',
                 from_language='en', to_language='zh'
             )
-            if result and result.strip() and len(result.strip()) > 0:
+            if result and result.strip():
                 return result.strip()
-        except Exception:
-            pass
+            raise Exception("必应返回空结果")
+        backends.append(("bing", _do_bing))
 
-    # 方案2: MyMemory 免费 API（快速）
-    try:
-        return _translate_mymemory(text)
-    except Exception:
-        pass
+    backends.append(("mymemory", lambda: _translate_mymemory(text)))
+    backends.append(("google",  lambda: _translate_google(text)))
 
-    # 方案3: Google Translate 备用
+    if not backends:
+        raise Exception("没有可用的翻译后端")
+
+    pool = ThreadPoolExecutor(max_workers=len(backends))
+    futures = {}
+    errors = []
+
     try:
-        return _translate_google(text)
-    except Exception:
-        pass
+        for name, fn in backends:
+            futures[pool.submit(fn)] = name
+
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                result = fut.result()
+                if result:
+                    _add_to_cache(text, result)
+                    return result
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+    finally:
+        pool.shutdown(wait=False)
 
     raise Exception("所有翻译方式均失败，请检查网络连接")
+
+
+def _add_to_cache(key: str, value: str) -> None:
+    """将 key→value 加入 LRU 风格的缓存。"""
+    _cache[key] = value
+    _cache_keys.append(key)
+    if len(_cache_keys) > _CACHE_MAX:
+        stale = _cache_keys.pop(0)
+        _cache.pop(stale, None)
 
 
 def _translate_mymemory(text):
@@ -95,7 +133,7 @@ def _translate_mymemory(text):
     url = f"https://api.mymemory.translated.net/get?{params}"
     ctx = ssl.create_default_context()
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
         data = json.loads(resp.read().decode('utf-8'))
         if data.get('responseStatus') == 200:
             result = data['responseData']['translatedText'].strip()
@@ -119,7 +157,7 @@ def _translate_google(text):
         'User-Agent': 'Mozilla/5.0',
         'Referer': 'https://translate.google.com/',
     })
-    with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
         data = json.loads(resp.read().decode('utf-8'))
         # API returns: [[["translated","original",...]], ...]
         if data and data[0]:
@@ -175,22 +213,24 @@ class LyricsOverlay:
 
     def _build_ui(self):
         """创建所有界面控件。"""
+        bg = '#12121f'
+
         # 标题拖动条
-        self.bar = tk.Frame(self.root, bg='#12121f', height=18)
+        self.bar = tk.Frame(self.root, bg=bg, height=18)
         self.bar.pack(fill=tk.X, side=tk.TOP)
         self.bar.pack_propagate(False)
 
         tk.Label(
             self.bar, text=" T 划词翻译·必应",
             font=("Microsoft YaHei UI", 7), fg='#505060',
-            bg='#12121f'
+            bg=bg
         ).pack(side=tk.LEFT, padx=10)
 
         # 关闭按钮
         btn = tk.Label(
             self.bar, text="✕",
             font=("Microsoft YaHei UI", 10), fg='#505060',
-            bg='#12121f', cursor="hand2"
+            bg=bg, cursor="hand2"
         )
         btn.pack(side=tk.RIGHT, padx=10)
         btn.bind('<Button-1>', lambda e: self.hide())
@@ -202,14 +242,14 @@ class LyricsOverlay:
             fill=tk.X, padx=14)
 
         # 内容区域
-        body = tk.Frame(self.root, bg='#12121f')
+        body = tk.Frame(self.root, bg=bg)
         body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(6, 6))
 
         # 原文（灰色小字）
         self.lbl_src = tk.Label(
             body, text="",
             font=("Microsoft YaHei UI", 9), fg='#5a5a70',
-            bg='#12121f', anchor=tk.W, justify=tk.LEFT,
+            bg=bg, anchor=tk.W, justify=tk.LEFT,
             wraplength=self.win_w - 34
         )
         self.lbl_src.pack(fill=tk.X)
@@ -218,7 +258,7 @@ class LyricsOverlay:
         self.lbl_dst = tk.Label(
             body, text="",
             font=("Microsoft YaHei UI", 13), fg='#d0d0e0',
-            bg='#12121f', anchor=tk.W, justify=tk.LEFT,
+            bg=bg, anchor=tk.W, justify=tk.LEFT,
             wraplength=self.win_w - 34
         )
         self.lbl_dst.pack(fill=tk.X)
@@ -227,7 +267,7 @@ class LyricsOverlay:
         self.lbl_status = tk.Label(
             self.root, text="",
             font=("Microsoft YaHei UI", 7), fg='#404055',
-            bg='#12121f', anchor=tk.W
+            bg=bg, anchor=tk.W
         )
         self.lbl_status.pack(fill=tk.X, padx=16, pady=(0, 4))
 
@@ -290,6 +330,8 @@ class LyricsOverlay:
 
     def hide(self, event=None):
         self.root.withdraw()
+        self._last_text = ""
+        self._busy = False
 
     def _flash(self, msg):
         self.lbl_status.config(text=msg, fg='#ff5252')
@@ -378,7 +420,7 @@ class LyricsOverlay:
                         self.root.after(0, self.translate, cur)
             except Exception:
                 pass
-            time.sleep(0.3)
+            time.sleep(0.2)
 
     # ── 生命周期 ─────────────────────────────────────────
 
