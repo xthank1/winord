@@ -17,6 +17,118 @@ import ssl
 import urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import ctypes
+import os
+import textwrap
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _LAYERED_OK = sys.platform == 'win32'
+except ImportError:
+    _LAYERED_OK = False
+
+# ── Windows 分层窗口辅助（逐像素 Alpha，消除描边）──────────
+
+if _LAYERED_OK:
+    _WS_EX_LAYERED = 0x00080000
+    _GWL_EXSTYLE = -20
+    _ULW_ALPHA = 0x00000002
+    _AC_SRC_ALPHA = 0x01
+    _SWP_FLAGS = 0x0002 | 0x0001 | 0x0004 | 0x0020
+
+    class _BLENDFUNCTION(ctypes.Structure):
+        _fields_ = [
+            ("BlendOp", ctypes.c_byte),
+            ("BlendFlags", ctypes.c_byte),
+            ("SourceConstantAlpha", ctypes.c_byte),
+            ("AlphaFormat", ctypes.c_byte),
+        ]
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class _SIZE(ctypes.Structure):
+        _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+    class _BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", ctypes.c_uint32),
+            ("biWidth", ctypes.c_int32),
+            ("biHeight", ctypes.c_int32),
+            ("biPlanes", ctypes.c_uint16),
+            ("biBitCount", ctypes.c_uint16),
+            ("biCompression", ctypes.c_uint32),
+            ("biSizeImage", ctypes.c_uint32),
+            ("biXPelsPerMeter", ctypes.c_int32),
+            ("biYPelsPerMeter", ctypes.c_int32),
+            ("biClrUsed", ctypes.c_uint32),
+            ("biClrImportant", ctypes.c_uint32),
+        ]
+
+    class _BITMAPINFO(ctypes.Structure):
+        _fields_ = [("bmiHeader", _BITMAPINFOHEADER)]
+
+    def _set_layered(hwnd):
+        u32 = ctypes.windll.user32
+        style = u32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+        u32.SetWindowLongW(hwnd, _GWL_EXSTYLE, style | _WS_EX_LAYERED)
+        u32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, _SWP_FLAGS)
+
+    def _update_layered(hwnd, pil_img, x, y):
+        w, h = pil_img.size
+        raw = pil_img.tobytes()
+        buf = bytearray(len(raw))
+        for i in range(0, len(raw), 4):
+            r, g, b, a = raw[i], raw[i + 1], raw[i + 2], raw[i + 3]
+            if a:
+                r = (r * a) // 255
+                g = (g * a) // 255
+                b = (b * a) // 255
+            buf[i] = b
+            buf[i + 1] = g
+            buf[i + 2] = r
+            buf[i + 3] = a
+
+        u32 = ctypes.windll.user32
+        gdi = ctypes.windll.gdi32
+
+        hdc_screen = u32.GetDC(0)
+        hdc_mem = gdi.CreateCompatibleDC(hdc_screen)
+
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+
+        pbits = ctypes.c_void_p()
+        hbmp = gdi.CreateDIBSection(
+            hdc_mem, ctypes.byref(bmi), 0,
+            ctypes.byref(pbits), None, 0
+        )
+        ctypes.memmove(pbits, bytes(buf), len(buf))
+
+        old_bmp = gdi.SelectObject(hdc_mem, hbmp)
+
+        bf = _BLENDFUNCTION()
+        bf.BlendOp = 0
+        bf.SourceConstantAlpha = 255
+        bf.AlphaFormat = _AC_SRC_ALPHA
+
+        pt_src = _POINT(0, 0)
+        pt_dst = _POINT(x, y)
+        sz = _SIZE(w, h)
+
+        u32.UpdateLayeredWindow(
+            hwnd, hdc_screen, ctypes.byref(pt_dst), ctypes.byref(sz),
+            hdc_mem, ctypes.byref(pt_src), 0, ctypes.byref(bf), _ULW_ALPHA
+        )
+
+        gdi.SelectObject(hdc_mem, old_bmp)
+        gdi.DeleteObject(hbmp)
+        gdi.DeleteDC(hdc_mem)
+        u32.ReleaseDC(0, hdc_screen)
 
 # ── 依赖检查 ──────────────────────────────────────────────
 
@@ -171,158 +283,215 @@ def _translate_google(text):
 # ── 悬浮窗 UI ─────────────────────────────────────────────
 
 class LyricsOverlay:
-    """桌面歌词风格的翻译悬浮窗 — 仅显示译文，楷体，滚轮换色。"""
+    """桌面歌词风格的翻译悬浮窗。
 
-    TRANSP_COLOR = '#010203'   # 文本窗口透明色，不与文字色冲突
+    Windows 分层窗口 + PIL 逐像素 Alpha 渲染，文字边缘干净无描边/阴影。
+    """
 
-    # 滚轮循环的译文字体颜色
     DST_COLORS = [
-        '#222222', '#CC0000', '#0066CC', '#339933',
-        '#CC6600', '#9933CC', '#008B8B', '#CC3366',
+        '#FFE501',  # 黄色
+        '#229712',  # 深绿
+        '#5F10DD',  # 深蓝
+        '#FF3C88',  # 深粉
     ]
 
     def __init__(self):
+        if not _LAYERED_OK:
+            print("=" * 50)
+            print("  缺少依赖: Pillow")
+            print("  请运行: pip install Pillow")
+            print("=" * 50)
+            input("按回车退出...")
+            sys.exit(1)
+
         self._color_idx = 0
         self._dst_colors = self.DST_COLORS
 
-        # ── 背景窗口（完全透明） ──
-        self.bg = tk.Tk()
-        self.bg.withdraw()
-        self.bg.overrideredirect(True)
-        self.bg.attributes('-topmost', True)
-        self.bg.attributes('-alpha', 0.0)
-        self.bg.configure(bg='#000000')
+        self._pad_x = 12
+        self._pad_y = 8
 
-        # 尺寸与位置
-        self.win_w = 580
-        self.win_h = 50
-        sw = self.bg.winfo_screenwidth()
-        sh = self.bg.winfo_screenheight()
-        self._x = (sw - self.win_w) // 2
-        self._y = sh - self.win_h - 110
-        self.bg.geometry(f"{self.win_w}x{self.win_h}+{self._x}+{self._y}")
+        # 获取屏幕尺寸
+        tmp = tk.Tk()
+        tmp.withdraw()
+        sw = tmp.winfo_screenwidth()
+        sh = tmp.winfo_screenheight()
+        tmp.destroy()
 
-        # ── 文本窗口（透明背景 + 不透明文字） ──
-        self.txt = tk.Toplevel(self.bg)
-        self.txt.withdraw()
-        self.txt.overrideredirect(True)
-        self.txt.attributes('-topmost', True)
-        self.txt.attributes('-transparentcolor', self.TRANSP_COLOR)
-        self.txt.configure(bg=self.TRANSP_COLOR)
-        self.txt.geometry(f"{self.win_w}x{self.win_h}+{self._x}+{self._y}")
+        self._win_w = 580
+        self._win_h = 50
+        self._x = (sw - self._win_w) // 2
+        self._y = sh - self._win_h - 110
 
-        # ── 状态 ──
+        # 创建主窗口
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.overrideredirect(True)
+        self.root.attributes('-topmost', True)
+        self.root.configure(bg='#000000')
+        self.root.geometry(f"{self._win_w}x{self._win_h}+{self._x}+{self._y}")
+
+        # 设为分层窗口
+        self.root.update_idletasks()
+        self._hwnd = int(self.root.frame(), 16)
+        _set_layered(self._hwnd)
+
+        # 加载楷体
+        self._pil_font = self._load_font()
+        self._current_text = ""
+
+        # 状态
         self._last_text = ""
         self._busy = False
         self._running = True
 
-        # ── 构建界面、绑定事件 ──
-        self._build_ui()
+        # 事件绑定
         self._bind_events()
 
-        # ── 启动后台任务 ──
+        # 后台任务
         threading.Thread(target=self._clipboard_watch, daemon=True).start()
         threading.Thread(target=_load_bing_engine, daemon=True).start()
 
-        # ── 初始显示 ──
+        # 初始显示
         self._show("划词翻译就绪 · 复制英文即可翻译")
         self.show()
+        self._keep_on_top()
 
-    # ── UI 构建 ──────────────────────────────────────────
-
-    def _build_ui(self):
-        """创建界面控件 — 仅译文标签，楷体，整个区域可拖拽。"""
-        tc = self.TRANSP_COLOR
-
-        self.lbl_dst = tk.Label(
-            self.txt, text="",
-            font=("KaiTi", 16), fg=self._dst_colors[0],
-            bg=tc, anchor=tk.W, justify=tk.LEFT,
-            wraplength=self.win_w - 24,
-            cursor="fleur"
-        )
-        self.lbl_dst.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+    def _load_font(self):
+        windir = os.environ.get('WINDIR', 'C:/Windows')
+        paths = [
+            f"{windir}/Fonts/simkai.ttf",
+            f"{windir}/Fonts/kaiu.ttf",
+            f"{windir}/Fonts/STKAITI.TTF",
+        ]
+        for path in paths:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, 16)
+                except Exception:
+                    pass
+        return ImageFont.load_default()
 
     # ── 事件绑定 ──────────────────────────────────────────
 
     def _bind_events(self):
-        # 整个译文标签可拖拽
-        self.lbl_dst.bind('<Button-1>', self._drag_start)
-        self.lbl_dst.bind('<B1-Motion>', self._drag)
+        self.root.bind('<Button-1>', self._drag_start)
+        self.root.bind('<B1-Motion>', self._drag)
+        self.root.bind('<Button-3>', self.hide)
+        self.root.bind('<Escape>', self.hide)
+        self.root.bind('<MouseWheel>', self._on_scroll)
+        self.root.bind('<Double-Button-1>', self._copy_dst)
 
-        def hide_fn(e):
-            self.hide()
+    # ── PIL 文字渲染 ────────────────────────────────────
 
-        for w in (self.bg, self.txt, self.lbl_dst):
-            w.bind('<Button-3>', hide_fn)
-            w.bind('<Escape>', hide_fn)
-            w.bind('<MouseWheel>', self._on_scroll)
+    def _render(self, text, color=None):
+        if color is None:
+            color = self._dst_colors[self._color_idx]
 
-        self.lbl_dst.bind('<Double-Button-1>', self._copy_dst)
+        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+        font = self._pil_font
+        max_w = self._win_w - self._pad_x * 2
+
+        # 逐字符换行
+        dummy = ImageDraw.Draw(Image.new('RGBA', (1, 1)))
+        lines = []
+        cur = ""
+        for ch in text:
+            test = cur + ch
+            bb = dummy.textbbox((0, 0), test, font=font)
+            if bb[2] - bb[0] > max_w and cur:
+                lines.append(cur)
+                cur = ch
+            else:
+                cur = test
+        if cur:
+            lines.append(cur)
+
+        wrapped = '\n'.join(lines)
+
+        bb = dummy.multiline_textbbox((0, 0), wrapped, font=font, spacing=4)
+        tw = bb[2] - bb[0]
+        th = bb[3] - bb[1]
+
+        iw = max(tw + self._pad_x * 2, self._win_w)
+        ih = max(th + self._pad_y * 2, 30)
+        ih = min(ih, 300)
+
+        img = Image.new('RGBA', (iw, ih), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.multiline_text(
+            (self._pad_x, self._pad_y), wrapped,
+            font=font, fill=(r, g, b, 255), spacing=4
+        )
+        return img, iw, ih
+
+    # ── 显示控制 ────────────────────────────────────────
+
+    def _show(self, text):
+        self._current_text = text
+        img, w, h = self._render(text)
+        self.root.geometry(f"{w}x{h}")
+        _update_layered(self._hwnd, img, self._x, self._y)
+
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
+
+    def hide(self, event=None):
+        self.root.withdraw()
+        self._last_text = ""
+        self._busy = False
+
+    def _keep_on_top(self):
+        if not self._running:
+            return
+        try:
+            self.root.lift()
+        except Exception:
+            pass
+        self.root.after(300, self._keep_on_top)
 
     # ── 拖拽移动 ─────────────────────────────────────────
 
     def _drag_start(self, event):
-        self._dx = event.x_root
-        self._dy = event.y_root
+        self._dx = event.x_root - self._x
+        self._dy = event.y_root - self._y
 
     def _drag(self, event):
-        dx = event.x_root - self._dx
-        dy = event.y_root - self._dy
-        self._x += dx
-        self._y += dy
-        geo = f"+{self._x}+{self._y}"
-        self.bg.geometry(geo)
-        self.txt.geometry(geo)
-        self._dx = event.x_root
-        self._dy = event.y_root
+        self._x = event.x_root - self._dx
+        self._y = event.y_root - self._dy
+        self.root.geometry(f"+{self._x}+{self._y}")
 
-    # ── 滚轮切换文字颜色 ─────────────────────────────────
+    # ── 滚轮切换颜色 ────────────────────────────────────
 
     def _on_scroll(self, event):
         if event.delta > 0:
             self._color_idx = (self._color_idx + 1) % len(self._dst_colors)
         else:
             self._color_idx = (self._color_idx - 1) % len(self._dst_colors)
-        self.lbl_dst.config(fg=self._dst_colors[self._color_idx])
+        if self._current_text:
+            img, _, _ = self._render(self._current_text)
+            _update_layered(self._hwnd, img, self._x, self._y)
 
     # ── 复制操作 ─────────────────────────────────────────
 
     def _copy_dst(self, event=None):
-        t = self.lbl_dst.cget('text')
-        if t:
-            pyperclip.copy(t)
+        if self._current_text:
+            pyperclip.copy(self._current_text)
             self._flash_copy()
 
-    # ── 窗口控制 ─────────────────────────────────────────
-
-    def show(self):
-        self.bg.deiconify()
-        self.txt.deiconify()
-        self.bg.lift()
-        self.txt.lift()
-
-    def hide(self, event=None):
-        self.bg.withdraw()
-        self.txt.withdraw()
-        self._last_text = ""
-        self._busy = False
-
     def _flash_copy(self):
-        """短暂闪烁提示复制成功。"""
-        saved = self.lbl_dst.cget('fg')
-        self.lbl_dst.config(fg='#ff5252')
-        def reset():
-            self.lbl_dst.config(fg=saved)
-        self.txt.after(600, reset)
+        saved = self._dst_colors[self._color_idx]
+        img, _, _ = self._render(self._current_text, '#ff5252')
+        _update_layered(self._hwnd, img, self._x, self._y)
 
-    def _show(self, text):
-        self.lbl_dst.config(text=text)
+        def reset():
+            img2, _, _ = self._render(self._current_text, saved)
+            _update_layered(self._hwnd, img2, self._x, self._y)
+        self.root.after(600, reset)
 
     # ── 翻译逻辑 ─────────────────────────────────────────
 
     def translate(self, text):
-        """将剪贴板文本送入翻译队列。"""
         if self._busy:
             return
 
@@ -339,39 +508,25 @@ class LyricsOverlay:
         self._last_text = text
         self._busy = True
 
-        # 立即更新 UI
-        self.lbl_dst.config(text="翻译中...")
-        self._auto_height()
+        self._show("翻译中...")
         self.show()
 
         threading.Thread(target=self._run_translate, args=(text,), daemon=True).start()
 
     def _run_translate(self, text):
-        """后台线程：执行翻译。"""
         try:
             result = translate(text)
         except Exception as e:
             result = f"翻译失败: {e}"
-        self.txt.after(0, self._on_result, result)
+        self.root.after(0, self._on_result, result)
 
     def _on_result(self, result):
-        """主线程：更新翻译结果。"""
-        self.lbl_dst.config(text=result)
+        self._show(result)
         self._busy = False
-        self._auto_height()
 
-    def _auto_height(self):
-        """自适应窗口高度。"""
-        self.txt.update_idletasks()
-        needed = self.lbl_dst.winfo_reqheight() + 20
-        new_h = max(40, min(300, needed))
-        self.bg.geometry(f"{self.win_w}x{new_h}")
-        self.txt.geometry(f"{self.win_w}x{new_h}")
-
-    # ── 剪贴板监听 ───────────────────────────────────────
+    # ── 剪贴板监听 ─────────────────────────────────────
 
     def _clipboard_watch(self):
-        """后台线程：轮询剪贴板变化。"""
         last = ""
         try:
             last = pyperclip.paste()
@@ -384,22 +539,20 @@ class LyricsOverlay:
                 if cur and cur != last:
                     last = cur
                     if re.search(r'[a-zA-Z]', cur):
-                        self.txt.after(0, self.translate, cur)
+                        self.root.after(0, self.translate, cur)
             except Exception:
                 pass
             time.sleep(0.2)
 
-    # ── 生命周期 ─────────────────────────────────────────
+    # ── 生命周期 ───────────────────────────────────────
 
     def run(self):
-        self.bg.protocol("WM_DELETE_WINDOW", self._stop)
-        self.txt.protocol("WM_DELETE_WINDOW", self._stop)
-        self.bg.mainloop()
+        self.root.protocol("WM_DELETE_WINDOW", self._stop)
+        self.root.mainloop()
 
     def _stop(self):
         self._running = False
-        self.bg.destroy()
-        self.txt.destroy()
+        self.root.destroy()
 
 
 # ── 入口 ──────────────────────────────────────────────────
