@@ -171,26 +171,45 @@ def _translate_google(text):
 # ── 悬浮窗 UI ─────────────────────────────────────────────
 
 class LyricsOverlay:
-    """桌面歌词风格的翻译悬浮窗。"""
+    """桌面歌词风格的翻译悬浮窗 — 仅显示译文，楷体，滚轮换色。"""
+
+    TRANSP_COLOR = '#010203'   # 文本窗口透明色，不与文字色冲突
+
+    # 滚轮循环的译文字体颜色
+    DST_COLORS = [
+        '#222222', '#CC0000', '#0066CC', '#339933',
+        '#CC6600', '#9933CC', '#008B8B', '#CC3366',
+    ]
 
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.withdraw()
+        self._color_idx = 0
+        self._dst_colors = self.DST_COLORS
 
-        # ── 窗口属性 ──
-        self.root.overrideredirect(True)          # 无标题栏
-        self.root.attributes('-topmost', True)     # 始终置顶
-        self.root.attributes('-alpha', 0.90)       # 半透明
-        self.root.configure(bg='#12121f')
+        # ── 背景窗口（完全透明） ──
+        self.bg = tk.Tk()
+        self.bg.withdraw()
+        self.bg.overrideredirect(True)
+        self.bg.attributes('-topmost', True)
+        self.bg.attributes('-alpha', 0.0)
+        self.bg.configure(bg='#000000')
 
-        # 尺寸与位置：底部居中
+        # 尺寸与位置
         self.win_w = 580
-        self.win_h = 72
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = (sw - self.win_w) // 2
-        y = sh - self.win_h - 110
-        self.root.geometry(f"{self.win_w}x{self.win_h}+{x}+{y}")
+        self.win_h = 50
+        sw = self.bg.winfo_screenwidth()
+        sh = self.bg.winfo_screenheight()
+        self._x = (sw - self.win_w) // 2
+        self._y = sh - self.win_h - 110
+        self.bg.geometry(f"{self.win_w}x{self.win_h}+{self._x}+{self._y}")
+
+        # ── 文本窗口（透明背景 + 不透明文字） ──
+        self.txt = tk.Toplevel(self.bg)
+        self.txt.withdraw()
+        self.txt.overrideredirect(True)
+        self.txt.attributes('-topmost', True)
+        self.txt.attributes('-transparentcolor', self.TRANSP_COLOR)
+        self.txt.configure(bg=self.TRANSP_COLOR)
+        self.txt.geometry(f"{self.win_w}x{self.win_h}+{self._x}+{self._y}")
 
         # ── 状态 ──
         self._last_text = ""
@@ -212,79 +231,34 @@ class LyricsOverlay:
     # ── UI 构建 ──────────────────────────────────────────
 
     def _build_ui(self):
-        """创建所有界面控件。"""
-        bg = '#12121f'
+        """创建界面控件 — 仅译文标签，楷体，整个区域可拖拽。"""
+        tc = self.TRANSP_COLOR
 
-        # 标题拖动条
-        self.bar = tk.Frame(self.root, bg=bg, height=18)
-        self.bar.pack(fill=tk.X, side=tk.TOP)
-        self.bar.pack_propagate(False)
-
-        tk.Label(
-            self.bar, text=" T 划词翻译·必应",
-            font=("Microsoft YaHei UI", 7), fg='#505060',
-            bg=bg
-        ).pack(side=tk.LEFT, padx=10)
-
-        # 关闭按钮
-        btn = tk.Label(
-            self.bar, text="✕",
-            font=("Microsoft YaHei UI", 10), fg='#505060',
-            bg=bg, cursor="hand2"
-        )
-        btn.pack(side=tk.RIGHT, padx=10)
-        btn.bind('<Button-1>', lambda e: self.hide())
-        btn.bind('<Enter>', lambda e: btn.config(fg='#ff5252'))
-        btn.bind('<Leave>', lambda e: btn.config(fg='#505060'))
-
-        # 分隔线
-        tk.Frame(self.root, bg='#252540', height=1).pack(
-            fill=tk.X, padx=14)
-
-        # 内容区域
-        body = tk.Frame(self.root, bg=bg)
-        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(6, 6))
-
-        # 原文（灰色小字）
-        self.lbl_src = tk.Label(
-            body, text="",
-            font=("Microsoft YaHei UI", 9), fg='#5a5a70',
-            bg=bg, anchor=tk.W, justify=tk.LEFT,
-            wraplength=self.win_w - 34
-        )
-        self.lbl_src.pack(fill=tk.X)
-
-        # 译文（亮色大字）
         self.lbl_dst = tk.Label(
-            body, text="",
-            font=("Microsoft YaHei UI", 13), fg='#d0d0e0',
-            bg=bg, anchor=tk.W, justify=tk.LEFT,
-            wraplength=self.win_w - 34
+            self.txt, text="",
+            font=("KaiTi", 16), fg=self._dst_colors[0],
+            bg=tc, anchor=tk.W, justify=tk.LEFT,
+            wraplength=self.win_w - 24,
+            cursor="fleur"
         )
-        self.lbl_dst.pack(fill=tk.X)
-
-        # 状态栏
-        self.lbl_status = tk.Label(
-            self.root, text="",
-            font=("Microsoft YaHei UI", 7), fg='#404055',
-            bg=bg, anchor=tk.W
-        )
-        self.lbl_status.pack(fill=tk.X, padx=16, pady=(0, 4))
+        self.lbl_dst.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
     # ── 事件绑定 ──────────────────────────────────────────
 
     def _bind_events(self):
-        draggables = (self.bar, self.lbl_src, self.lbl_dst)
-        for w in draggables:
-            w.bind('<Button-1>', self._drag_start, add='+')
-            w.bind('<B1-Motion>', self._drag, add='+')
+        # 整个译文标签可拖拽
+        self.lbl_dst.bind('<Button-1>', self._drag_start)
+        self.lbl_dst.bind('<B1-Motion>', self._drag)
 
-        self.root.bind('<Button-3>', lambda e: self.hide())
-        self.root.bind('<Escape>', lambda e: self.hide())
-        self.root.bind('<MouseWheel>', self._on_scroll)
+        def hide_fn(e):
+            self.hide()
+
+        for w in (self.bg, self.txt, self.lbl_dst):
+            w.bind('<Button-3>', hide_fn)
+            w.bind('<Escape>', hide_fn)
+            w.bind('<MouseWheel>', self._on_scroll)
 
         self.lbl_dst.bind('<Double-Button-1>', self._copy_dst)
-        self.lbl_src.bind('<Double-Button-1>', self._copy_src)
 
     # ── 拖拽移动 ─────────────────────────────────────────
 
@@ -293,19 +267,24 @@ class LyricsOverlay:
         self._dy = event.y_root
 
     def _drag(self, event):
-        x = self.root.winfo_x() + event.x_root - self._dx
-        y = self.root.winfo_y() + event.y_root - self._dy
-        self.root.geometry(f"+{x}+{y}")
+        dx = event.x_root - self._dx
+        dy = event.y_root - self._dy
+        self._x += dx
+        self._y += dy
+        geo = f"+{self._x}+{self._y}"
+        self.bg.geometry(geo)
+        self.txt.geometry(geo)
         self._dx = event.x_root
         self._dy = event.y_root
 
-    # ── 滚轮调透明度 ─────────────────────────────────────
+    # ── 滚轮切换文字颜色 ─────────────────────────────────
 
     def _on_scroll(self, event):
-        a = self.root.attributes('-alpha')
-        a = max(0.25, min(1.0, a + (0.05 if event.delta > 0 else -0.05)))
-        self.root.attributes('-alpha', a)
-        self._flash(f"透明度 {int(a * 100)}%")
+        if event.delta > 0:
+            self._color_idx = (self._color_idx + 1) % len(self._dst_colors)
+        else:
+            self._color_idx = (self._color_idx - 1) % len(self._dst_colors)
+        self.lbl_dst.config(fg=self._dst_colors[self._color_idx])
 
     # ── 复制操作 ─────────────────────────────────────────
 
@@ -313,40 +292,32 @@ class LyricsOverlay:
         t = self.lbl_dst.cget('text')
         if t:
             pyperclip.copy(t)
-            self._flash("已复制译文 ✓")
-
-    def _copy_src(self, event=None):
-        t = self.lbl_src.cget('text')
-        if t:
-            pyperclip.copy(t)
-            self._flash("已复制原文 ✓")
+            self._flash_copy()
 
     # ── 窗口控制 ─────────────────────────────────────────
 
     def show(self):
-        self.root.deiconify()
-        self.root.lift()
-        self.root.attributes('-topmost', True)
+        self.bg.deiconify()
+        self.txt.deiconify()
+        self.bg.lift()
+        self.txt.lift()
 
     def hide(self, event=None):
-        self.root.withdraw()
+        self.bg.withdraw()
+        self.txt.withdraw()
         self._last_text = ""
         self._busy = False
 
-    def _flash(self, msg):
-        self.lbl_status.config(text=msg, fg='#ff5252')
-        self.root.after(2000, lambda: self.lbl_status.config(
-            text="就绪" if _bing_ready else "必应引擎加载中...",
-            fg='#404055'
-        ))
+    def _flash_copy(self):
+        """短暂闪烁提示复制成功。"""
+        saved = self.lbl_dst.cget('fg')
+        self.lbl_dst.config(fg='#ff5252')
+        def reset():
+            self.lbl_dst.config(fg=saved)
+        self.txt.after(600, reset)
 
     def _show(self, text):
-        self.lbl_src.config(text="")
         self.lbl_dst.config(text=text)
-        self.lbl_status.config(
-            text="就绪" if _bing_ready else "必应引擎加载中...",
-            fg='#404055'
-        )
 
     # ── 翻译逻辑 ─────────────────────────────────────────
 
@@ -369,9 +340,7 @@ class LyricsOverlay:
         self._busy = True
 
         # 立即更新 UI
-        self.lbl_src.config(text=text[:200])
-        self.lbl_dst.config(text="⏳ 翻译中...")
-        self.lbl_status.config(text="翻译中...", fg='#505060')
+        self.lbl_dst.config(text="翻译中...")
         self._auto_height()
         self.show()
 
@@ -383,23 +352,21 @@ class LyricsOverlay:
             result = translate(text)
         except Exception as e:
             result = f"翻译失败: {e}"
-        self.root.after(0, self._on_result, result)
+        self.txt.after(0, self._on_result, result)
 
     def _on_result(self, result):
         """主线程：更新翻译结果。"""
         self.lbl_dst.config(text=result)
-        self.lbl_status.config(text="就绪", fg='#404055')
         self._busy = False
         self._auto_height()
 
     def _auto_height(self):
         """自适应窗口高度。"""
-        self.root.update_idletasks()
-        src_h = self.lbl_src.winfo_reqheight()
-        dst_h = self.lbl_dst.winfo_reqheight()
-        needed = src_h + dst_h + 44
-        new_h = max(72, min(300, needed))
-        self.root.geometry(f"{self.win_w}x{new_h}")
+        self.txt.update_idletasks()
+        needed = self.lbl_dst.winfo_reqheight() + 20
+        new_h = max(40, min(300, needed))
+        self.bg.geometry(f"{self.win_w}x{new_h}")
+        self.txt.geometry(f"{self.win_w}x{new_h}")
 
     # ── 剪贴板监听 ───────────────────────────────────────
 
@@ -417,7 +384,7 @@ class LyricsOverlay:
                 if cur and cur != last:
                     last = cur
                     if re.search(r'[a-zA-Z]', cur):
-                        self.root.after(0, self.translate, cur)
+                        self.txt.after(0, self.translate, cur)
             except Exception:
                 pass
             time.sleep(0.2)
@@ -425,12 +392,14 @@ class LyricsOverlay:
     # ── 生命周期 ─────────────────────────────────────────
 
     def run(self):
-        self.root.protocol("WM_DELETE_WINDOW", self._stop)
-        self.root.mainloop()
+        self.bg.protocol("WM_DELETE_WINDOW", self._stop)
+        self.txt.protocol("WM_DELETE_WINDOW", self._stop)
+        self.bg.mainloop()
 
     def _stop(self):
         self._running = False
-        self.root.destroy()
+        self.bg.destroy()
+        self.txt.destroy()
 
 
 # ── 入口 ──────────────────────────────────────────────────
@@ -438,13 +407,13 @@ class LyricsOverlay:
 def main():
     print()
     print("  ╔══════════════════════════════════╗")
-    print("  ║    划词翻译 v1.1               ║")
+    print("  ║    划词翻译 v1.2               ║")
     print("  ║    Bing · English → 中文       ║")
     print("  ╚══════════════════════════════════╝")
     print()
     print("  悬浮窗已显示在屏幕底部中央")
     print("  用法: 选中英文 → Ctrl+C → 自动翻译")
-    print("  操作: 拖拽移动 | 右键隐藏 | 滚轮调透明度")
+    print("  操作: 拖拽移动 | 右键/Esc隐藏 | 滚轮切换文字颜色")
     print()
 
     app = LyricsOverlay()
