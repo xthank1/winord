@@ -18,6 +18,11 @@ import ctypes
 import os
 import textwrap
 
+# ── DeepL API Key ───────────────────────────────────────────
+# 从环境变量 DEEPL_API_KEY 读取，或直接在此赋值
+# 免费注册: https://www.deepl.com/pro-api
+_DEEPL_API_KEY = os.environ.get('DEEPL_API_KEY', '')
+
 # ── HTTP 连接池（复用 TCP/TLS 连接，减少握手开销） ──────
 
 _http_sessions = {}
@@ -202,7 +207,7 @@ _CACHE_MAX = 128
 def translate(text):
     """
     翻译英文 → 中文。
-    并行竞速：必应 / MyMemory 同时发起，取最快返回的有效结果。
+    并行竞速：必应 / DeepL / MyMemory 同时发起，取最快返回的有效结果。
     """
     text = text.strip()
     if not text:
@@ -227,6 +232,9 @@ def translate(text):
                 return result.strip()
             raise Exception("必应返回空结果")
         backends.append(("bing", _do_bing))
+
+    if _DEEPL_API_KEY:
+        backends.append(("deepl", lambda: _translate_deepl(text)))
 
     backends.append(("mymemory", lambda: _translate_mymemory(text)))
 
@@ -287,6 +295,29 @@ def _translate_mymemory(text):
     raise Exception("MyMemory 返回空结果")
 
 
+def _translate_deepl(text):
+    """DeepL 翻译 API（免费版，需配置 DEEPL_API_KEY）。"""
+    if not _DEEPL_API_KEY:
+        raise Exception("DeepL API Key 未配置")
+    session = _get_session('api-free.deepl.com')
+    resp = session.post(
+        'https://api-free.deepl.com/v2/translate',
+        data={
+            'text': text,
+            'source_lang': 'EN',
+            'target_lang': 'ZH',
+        },
+        headers={'Authorization': f'DeepL-Auth-Key {_DEEPL_API_KEY}'},
+        timeout=_HTTP_TIMEOUT,
+    )
+    data = resp.json()
+    if 'translations' in data and data['translations']:
+        result = data['translations'][0]['text'].strip()
+        if result:
+            return result
+    raise Exception("DeepL 返回空结果")
+
+
 # ── 悬浮窗 UI ─────────────────────────────────────────────
 
 class LyricsOverlay:
@@ -317,6 +348,13 @@ class LyricsOverlay:
 
         self._pad_x = 12
         self._pad_y = 8
+
+        # 宽度拖拽调整
+        self._resizing = False
+        self._resize_margin = 8
+        self._resize_start_x = 0
+        self._resize_start_w = 0
+        self._win_w_min = 180
 
         # 获取屏幕尺寸
         tmp = tk.Tk()
@@ -385,6 +423,8 @@ class LyricsOverlay:
     def _bind_events(self):
         self.root.bind('<Button-1>', self._drag_start)
         self.root.bind('<B1-Motion>', self._drag)
+        self.root.bind('<ButtonRelease-1>', self._drag_end)
+        self.root.bind('<Motion>', self._on_motion)
         self.root.bind('<Button-3>', self.hide)
         self.root.bind('<Escape>', self.hide)
         self.root.bind('<MouseWheel>', self._on_scroll)
@@ -471,13 +511,44 @@ class LyricsOverlay:
     # ── 拖拽移动 ─────────────────────────────────────────
 
     def _drag_start(self, event):
-        self._dx = event.x_root - self._x
-        self._dy = event.y_root - self._y
+        if event.x >= self._win_w - self._resize_margin:
+            self._resizing = True
+            self._resize_start_x = event.x_root
+            self._resize_start_w = self._win_w
+        else:
+            self._resizing = False
+            self._dx = event.x_root - self._x
+            self._dy = event.y_root - self._y
 
     def _drag(self, event):
-        self._x = event.x_root - self._dx
-        self._y = event.y_root - self._dy
-        self.root.geometry(f"+{self._x}+{self._y}")
+        if self._resizing:
+            new_w = self._resize_start_w + (event.x_root - self._resize_start_x)
+            self._win_w = max(self._win_w_min, new_w)
+            if self._current_text:
+                img, w, h = self._render(self._current_text, hover=self._hover)
+                self.root.geometry(f"{w}x{h}")
+                _update_layered(self._hwnd, img, self._x, self._y)
+        else:
+            self._x = event.x_root - self._dx
+            self._y = event.y_root - self._dy
+            self.root.geometry(f"+{self._x}+{self._y}")
+
+    def _drag_end(self, event):
+        self._resizing = False
+
+    def _on_motion(self, event):
+        """鼠标靠近右边缘时显示水平调整光标。"""
+        if self._resizing:
+            return
+        if event.x >= self._win_w - self._resize_margin:
+            self._set_cursor(32644)  # IDC_SIZEWE
+        else:
+            self._set_cursor(32512)  # IDC_ARROW
+
+    def _set_cursor(self, cursor_id):
+        u32 = ctypes.windll.user32
+        hcursor = u32.LoadCursorW(0, cursor_id)
+        u32.SetCursor(hcursor)
 
     # ── 滚轮切换颜色 ────────────────────────────────────
 
@@ -590,13 +661,19 @@ class LyricsOverlay:
 def main():
     print()
     print("  ╔══════════════════════════════════╗")
-    print("  ║    划词翻译 v1.2               ║")
-    print("  ║    Bing · English → 中文       ║")
+    print("  ║    划词翻译 v1.3               ║")
+    print("  ║    Bing · DeepL · MyMemory     ║")
+    print("  ║    English → 中文              ║")
     print("  ╚══════════════════════════════════╝")
     print()
     print("  悬浮窗已显示在屏幕底部中央")
     print("  用法: 选中英文 → Ctrl+C → 自动翻译")
-    print("  操作: 拖拽移动 | 右键/Esc隐藏 | 滚轮切换文字颜色")
+    print("  操作: 拖拽移动 | 拖拽右缘调宽度 | 右键/Esc隐藏")
+    print("        滚轮切换颜色 | 双击复制译文")
+    if _DEEPL_API_KEY:
+        print("  DeepL: 已启用")
+    else:
+        print("  DeepL: 未配置 (设置环境变量 DEEPL_API_KEY 启用)")
     print()
 
     app = LyricsOverlay()
