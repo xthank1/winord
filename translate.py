@@ -151,6 +151,313 @@ if _LAYERED_OK:
         gdi.DeleteDC(hdc_mem)
         u32.ReleaseDC(0, hdc_screen)
 
+# ── 系统托盘常量与结构 ──────────────────────────────────────
+
+_NIM_ADD = 0
+_NIM_DELETE = 2
+_NIF_MESSAGE = 1
+_NIF_ICON = 2
+_NIF_TIP = 4
+_WM_TRAYICON = 0x8001
+_WM_RBUTTONUP = 0x0205
+_WM_LBUTTONUP = 0x0202
+_TPM_RETURNCMD = 0x0100
+_MF_STRING = 0x0000
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    """完整的 NOTIFYICONDATAW，兼容 Windows 10/11。"""
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("hWnd", ctypes.c_void_p),
+        ("uID", ctypes.c_uint32),
+        ("uFlags", ctypes.c_uint32),
+        ("uCallbackMessage", ctypes.c_uint32),
+        ("hIcon", ctypes.c_void_p),
+        ("szTip", ctypes.c_wchar * 128),
+        ("dwState", ctypes.c_uint32),
+        ("dwStateMask", ctypes.c_uint32),
+        ("szInfo", ctypes.c_wchar * 256),
+        ("uTimeout", ctypes.c_uint32),
+        ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", ctypes.c_uint32),
+        ("guidItem", _GUID),
+        ("hBalloonIcon", ctypes.c_void_p),
+    ]
+
+class _ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", ctypes.c_int32),
+        ("xHotspot", ctypes.c_uint32),
+        ("yHotspot", ctypes.c_uint32),
+        ("hbmMask", ctypes.c_void_p),
+        ("hbmColor", ctypes.c_void_p),
+    ]
+
+class _MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint32),
+        ("wParam", ctypes.c_uint64),
+        ("lParam", ctypes.c_longlong),
+        ("time", ctypes.c_uint32),
+        ("pt", _POINT),
+    ]
+
+# ── 系统托盘辅助函数 ────────────────────────────────────────
+
+_tray_running = False
+_tray_app = None
+_tray_hwnd = None
+_tray_nid = None
+
+def _pil_to_hicon(pil_img):
+    """将 PIL RGBA 图像转换为 Windows HICON。"""
+    w, h = pil_img.size
+    raw = pil_img.tobytes()
+
+    gdi = ctypes.windll.gdi32
+    u32 = ctypes.windll.user32
+
+    hdc = u32.GetDC(0)
+
+    # 颜色位图：BGRA premultiplied
+    color_buf = bytearray(w * h * 4)
+    mask_bits = []
+    for i in range(0, len(raw), 4):
+        r, g, b, a = raw[i], raw[i + 1], raw[i + 2], raw[i + 3]
+        color_buf[i] = b
+        color_buf[i + 1] = g
+        color_buf[i + 2] = r
+        color_buf[i + 3] = a
+        mask_bits.append(0 if a > 128 else 1)
+
+    bmi = _BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+
+    pbits = ctypes.c_void_p()
+    hbm_color = gdi.CreateDIBSection(
+        hdc, ctypes.byref(bmi), 0, ctypes.byref(pbits), None, 0
+    )
+    ctypes.memmove(pbits, bytes(color_buf), len(color_buf))
+
+    # 掩码位图：0=不透明，1=透明
+    scanline = ((w + 15) // 16) * 2
+    mask_buf = bytearray(scanline * h)
+    for row in range(h):
+        for col in range(w):
+            idx = row * w + col
+            if mask_bits[idx]:
+                byte_idx = row * scanline + col // 8
+                bit_idx = 7 - (col % 8)
+                mask_buf[byte_idx] |= (1 << bit_idx)
+
+    mask_data = (ctypes.c_ubyte * len(mask_buf)).from_buffer(mask_buf)
+    hbm_mask = gdi.CreateBitmap(w, h, 1, 1, mask_data)
+
+    ii = _ICONINFO()
+    ii.fIcon = 1
+    ii.hbmColor = hbm_color
+    ii.hbmMask = hbm_mask
+
+    hicon = u32.CreateIconIndirect(ctypes.byref(ii))
+
+    gdi.DeleteObject(hbm_color)
+    gdi.DeleteObject(hbm_mask)
+    u32.ReleaseDC(0, hdc)
+
+    return hicon
+
+
+def _create_tray_icon_image():
+    """创建 32x32 托盘图标（蓝底 "译" 字）。"""
+    size = 32
+    img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # 蓝色圆角矩形
+    draw.rounded_rectangle([(2, 2), (size - 2, size - 2)], radius=6,
+                           fill=(66, 133, 244, 255))
+
+    # 白色 "译" 字
+    windir = os.environ.get('WINDIR', 'C:/Windows')
+    font_paths = [
+        f"{windir}/Fonts/simkai.ttf",
+        f"{windir}/Fonts/msyh.ttc",
+        f"{windir}/Fonts/simsun.ttc",
+    ]
+    font = None
+    for fp in font_paths:
+        if os.path.exists(fp):
+            try:
+                font = ImageFont.truetype(fp, 20)
+                break
+            except Exception:
+                pass
+    if font is None:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), "译", font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    draw.text(((size - tw) // 2, (size - th) // 2 - 1), "译",
+              fill=(255, 255, 255, 255), font=font)
+
+    return img
+
+
+# 窗口过程类型
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_longlong, ctypes.c_void_p,
+    ctypes.c_uint32, ctypes.c_uint64, ctypes.c_longlong
+)
+
+
+@_WNDPROC
+def _tray_wndproc(hwnd, msg, wparam, lparam):
+    global _tray_app
+    u32 = ctypes.windll.user32
+
+    if msg == _WM_TRAYICON:
+        if lparam == _WM_RBUTTONUP:
+            menu = u32.CreatePopupMenu()
+            u32.AppendMenuW(menu, _MF_STRING, 1, "退出(&X)")
+            u32.SetForegroundWindow(hwnd)
+            pt = _POINT()
+            u32.GetCursorPos(ctypes.byref(pt))
+            cmd = u32.TrackPopupMenu(
+                menu, _TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, None
+            )
+            u32.DestroyMenu(menu)
+            if cmd == 1 and _tray_app is not None:
+                _tray_app.root.after(0, _tray_app._stop)
+        elif lparam == _WM_LBUTTONUP:
+            if _tray_app is not None:
+                _tray_app.root.after(0, _tray_app.show)
+
+    return u32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+def _run_tray():
+    """后台线程：创建隐藏窗口承载托盘图标。"""
+    global _tray_running, _tray_hwnd, _tray_nid
+
+    try:
+        u32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+        kernel32 = ctypes.windll.kernel32
+
+        # 确保 64 位 LRESULT
+        u32.DefWindowProcW.restype = ctypes.c_longlong
+        u32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                       ctypes.c_uint64, ctypes.c_longlong]
+
+        hinst = kernel32.GetModuleHandleW(None)
+
+        class_name = "WinrodTrayClass"
+        wc_name = ctypes.c_wchar_p(class_name)
+
+        # 尝试注销可能残留的旧类
+        u32.UnregisterClassW(wc_name, hinst)
+
+        class _WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint32),
+                ("style", ctypes.c_uint32),
+                ("lpfnWndProc", _WNDPROC),
+                ("cbClsExtra", ctypes.c_int32),
+                ("cbWndExtra", ctypes.c_int32),
+                ("hInstance", ctypes.c_void_p),
+                ("hIcon", ctypes.c_void_p),
+                ("hCursor", ctypes.c_void_p),
+                ("hbrBackground", ctypes.c_void_p),
+                ("lpszMenuName", ctypes.c_wchar_p),
+                ("lpszClassName", ctypes.c_wchar_p),
+                ("hIconSm", ctypes.c_void_p),
+            ]
+
+        wndclass = _WNDCLASSEXW()
+        wndclass.cbSize = ctypes.sizeof(wndclass)
+        wndclass.lpfnWndProc = _tray_wndproc
+        wndclass.hInstance = hinst
+        wndclass.lpszClassName = class_name
+
+        atom = u32.RegisterClassExW(ctypes.byref(wndclass))
+        if not atom:
+            err = kernel32.GetLastError()
+            print(f"[!] 托盘窗口类注册失败 (错误码: {err})")
+            return
+
+        # 创建隐藏窗口（消息窗口）
+        _tray_hwnd = u32.CreateWindowExW(
+            0, class_name, "", 0,
+            0, 0, 0, 0, 0, 0, hinst, 0
+        )
+
+        if not _tray_hwnd:
+            err = kernel32.GetLastError()
+            print(f"[!] 托盘窗口创建失败 (错误码: {err})")
+            u32.UnregisterClassW(class_name, hinst)
+            return
+
+        # 创建托盘图标
+        tray_img = _create_tray_icon_image()
+        hicon = _pil_to_hicon(tray_img)
+
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = _tray_hwnd
+        nid.uID = 1
+        nid.uFlags = _NIF_MESSAGE | _NIF_ICON | _NIF_TIP
+        nid.uCallbackMessage = _WM_TRAYICON
+        nid.hIcon = hicon
+        nid.szTip = "划词翻译"
+
+        if not shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(nid)):
+            err = kernel32.GetLastError()
+            print(f"[!] 托盘图标创建失败 (错误码: {err})")
+            u32.DestroyIcon(hicon)
+            u32.DestroyWindow(_tray_hwnd)
+            u32.UnregisterClassW(class_name, hinst)
+            return
+
+        _tray_nid = nid
+        _tray_running = True
+        print("[OK] 托盘图标已就绪")
+
+        # 消息循环
+        msg = _MSG()
+        while _tray_running:
+            # GetMessageW 阻塞等待，比 PeekMessage+sleep 更可靠
+            ret = u32.GetMessageW(ctypes.byref(msg), _tray_hwnd, 0, 0)
+            if ret <= 0:
+                break
+            u32.TranslateMessage(ctypes.byref(msg))
+            u32.DispatchMessageW(ctypes.byref(msg))
+
+        # 清理
+        shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+        if hicon:
+            u32.DestroyIcon(hicon)
+        if _tray_hwnd:
+            u32.DestroyWindow(_tray_hwnd)
+        u32.UnregisterClassW(class_name, hinst)
+
+    except Exception as e:
+        print(f"[!] 托盘线程异常: {e}")
+
+
 # ── 依赖检查 ──────────────────────────────────────────────
 
 try:
@@ -334,6 +641,9 @@ class LyricsOverlay:
     ]
 
     def __init__(self):
+        global _tray_app
+        _tray_app = self
+
         if not _LAYERED_OK:
             print("=" * 50)
             print("  缺少依赖: Pillow")
@@ -345,6 +655,7 @@ class LyricsOverlay:
         self._color_idx = 0
         self._dst_colors = self.DST_COLORS
         self._hover = False
+        self._locked = False
 
         self._pad_x = 12
         self._pad_y = 8
@@ -397,6 +708,7 @@ class LyricsOverlay:
         threading.Thread(target=self._clipboard_watch, daemon=True).start()
         threading.Thread(target=_load_bing_engine, daemon=True).start()
         threading.Thread(target=_prewarm_connections, daemon=True).start()
+        threading.Thread(target=_run_tray, daemon=True).start()
 
         # 初始显示
         self._show("划词翻译就绪 · 复制英文即可翻译")
@@ -425,7 +737,7 @@ class LyricsOverlay:
         self.root.bind('<B1-Motion>', self._drag)
         self.root.bind('<ButtonRelease-1>', self._drag_end)
         self.root.bind('<Motion>', self._on_motion)
-        self.root.bind('<Button-3>', self.hide)
+        self.root.bind('<Button-3>', self._toggle_lock)
         self.root.bind('<Escape>', self.hide)
         self.root.bind('<MouseWheel>', self._on_scroll)
         self.root.bind('<Double-Button-1>', self._copy_dst)
@@ -434,7 +746,7 @@ class LyricsOverlay:
 
     # ── PIL 文字渲染 ────────────────────────────────────
 
-    def _render(self, text, color=None, hover=False):
+    def _render(self, text, color=None, hover=False, locked=False):
         if color is None:
             color = self._dst_colors[self._color_idx]
 
@@ -442,11 +754,14 @@ class LyricsOverlay:
         font = self._pil_font
         max_w = self._win_w - self._pad_x * 2
 
+        # 锁定状态下在译文末尾追加锁图标
+        display_text = text + ('  🔒' if locked else '')
+
         # 逐字符换行
         dummy = ImageDraw.Draw(Image.new('RGBA', (1, 1)))
         lines = []
         cur = ""
-        for ch in text:
+        for ch in display_text:
             test = cur + ch
             bb = dummy.textbbox((0, 0), test, font=font)
             if bb[2] - bb[0] > max_w and cur:
@@ -486,7 +801,7 @@ class LyricsOverlay:
 
     def _show(self, text):
         self._current_text = text
-        img, w, h = self._render(text, hover=self._hover)
+        img, w, h = self._render(text, hover=self._hover, locked=self._locked)
         self.root.geometry(f"{w}x{h}")
         _update_layered(self._hwnd, img, self._x, self._y)
 
@@ -498,6 +813,10 @@ class LyricsOverlay:
         self.root.withdraw()
         self._last_text = ""
         self._busy = False
+        self._locked = False
+        # 解锁后刷新显示
+        if self._current_text and self._current_text != "划词翻译就绪 · 复制英文即可翻译":
+            pass
 
     def _keep_on_top(self):
         if not self._running:
@@ -525,7 +844,8 @@ class LyricsOverlay:
             new_w = self._resize_start_w + (event.x_root - self._resize_start_x)
             self._win_w = max(self._win_w_min, new_w)
             if self._current_text:
-                img, w, h = self._render(self._current_text, hover=self._hover)
+                img, w, h = self._render(self._current_text, hover=self._hover,
+                                         locked=self._locked)
                 self.root.geometry(f"{w}x{h}")
                 _update_layered(self._hwnd, img, self._x, self._y)
         else:
@@ -558,19 +878,31 @@ class LyricsOverlay:
         else:
             self._color_idx = (self._color_idx - 1) % len(self._dst_colors)
         if self._current_text:
-            img, _, _ = self._render(self._current_text, hover=self._hover)
+            img, _, _ = self._render(self._current_text, hover=self._hover,
+                                     locked=self._locked)
             _update_layered(self._hwnd, img, self._x, self._y)
 
     def _on_enter(self, event):
         self._hover = True
         if self._current_text:
-            img, _, _ = self._render(self._current_text, hover=True)
+            img, _, _ = self._render(self._current_text, hover=True,
+                                     locked=self._locked)
             _update_layered(self._hwnd, img, self._x, self._y)
 
     def _on_leave(self, event):
         self._hover = False
         if self._current_text:
-            img, _, _ = self._render(self._current_text, hover=False)
+            img, _, _ = self._render(self._current_text, hover=False,
+                                     locked=self._locked)
+            _update_layered(self._hwnd, img, self._x, self._y)
+
+    # ── 锁定 ─────────────────────────────────────────────
+
+    def _toggle_lock(self, event=None):
+        self._locked = not self._locked
+        if self._current_text:
+            img, _, _ = self._render(self._current_text, hover=self._hover,
+                                     locked=self._locked)
             _update_layered(self._hwnd, img, self._x, self._y)
 
     # ── 复制操作 ─────────────────────────────────────────
@@ -586,7 +918,8 @@ class LyricsOverlay:
         _update_layered(self._hwnd, img, self._x, self._y)
 
         def reset():
-            img2, _, _ = self._render(self._current_text, saved)
+            img2, _, _ = self._render(self._current_text, saved,
+                                      locked=self._locked)
             _update_layered(self._hwnd, img2, self._x, self._y)
         self.root.after(600, reset)
 
@@ -639,7 +972,7 @@ class LyricsOverlay:
                 cur = pyperclip.paste()
                 if cur and cur != last:
                     last = cur
-                    if re.search(r'[a-zA-Z]', cur):
+                    if not self._locked and re.search(r'[a-zA-Z]', cur):
                         self.root.after(0, self.translate, cur)
             except Exception:
                 pass
@@ -652,7 +985,12 @@ class LyricsOverlay:
         self.root.mainloop()
 
     def _stop(self):
+        global _tray_running
         self._running = False
+        _tray_running = False
+        # 唤醒托盘消息循环以便退出
+        if _tray_hwnd:
+            ctypes.windll.user32.PostMessageW(_tray_hwnd, 0x0012, 0, 0)  # WM_QUIT
         self.root.destroy()
 
 
@@ -661,15 +999,16 @@ class LyricsOverlay:
 def main():
     print()
     print("  ╔══════════════════════════════════╗")
-    print("  ║    划词翻译 v1.3               ║")
+    print("  ║    划词翻译 v1.4               ║")
     print("  ║    Bing · DeepL · MyMemory     ║")
     print("  ║    English → 中文              ║")
     print("  ╚══════════════════════════════════╝")
     print()
     print("  悬浮窗已显示在屏幕底部中央")
     print("  用法: 选中英文 → Ctrl+C → 自动翻译")
-    print("  操作: 拖拽移动 | 拖拽右缘调宽度 | 右键/Esc隐藏")
-    print("        滚轮切换颜色 | 双击复制译文")
+    print("  操作: 拖拽移动 | 拖拽右缘调宽度 | 右键锁定/解锁")
+    print("        滚轮切换颜色 | 双击复制译文 | Esc隐藏")
+    print("  托盘: 系统托盘图标右键可退出程序")
     if _DEEPL_API_KEY:
         print("  DeepL: 已启用")
     else:
